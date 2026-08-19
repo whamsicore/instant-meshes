@@ -21,16 +21,256 @@
 #include "normal.h"
 #include "extract.h"
 #include "bvh.h"
+#include "flowline_export.h"
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <tuple>
+#include <limits>
+
+static void apply_orientation_constraints_csv(MultiResolutionHierarchy &mRes,
+                                              const std::string &path,
+                                              int rosy, int posy) {
+    if (path.empty())
+        return;
+    std::ifstream in(path);
+    if (!in)
+        throw std::runtime_error("Failed to open orientation constraints: " + path);
+
+    mRes.clearConstraints();
+    const MatrixXf &V = mRes.V();
+    const MatrixXf &N = mRes.N();
+    MatrixXf &CQ = mRes.CQ();
+    VectorXf &CQw = mRes.CQw();
+
+    /* Build a coarse hash grid for nearest vertex lookup. */
+    Vector3f vmin = V.rowwise().minCoeff();
+    Vector3f vmax = V.rowwise().maxCoeff();
+    Float extent = (vmax - vmin).norm();
+    Float cell = std::max(extent / 64.0f, (Float) 1e-4);
+    std::map<std::tuple<int,int,int>, std::vector<uint32_t>> buckets;
+    for (uint32_t i = 0; i < (uint32_t) V.cols(); ++i) {
+        Vector3f p = V.col(i);
+        int ix = (int) std::floor((p.x() - vmin.x()) / cell);
+        int iy = (int) std::floor((p.y() - vmin.y()) / cell);
+        int iz = (int) std::floor((p.z() - vmin.z()) / cell);
+        buckets[std::make_tuple(ix, iy, iz)].push_back(i);
+    }
+
+    auto nearest = [&](const Vector3f &p) -> uint32_t {
+        int ix = (int) std::floor((p.x() - vmin.x()) / cell);
+        int iy = (int) std::floor((p.y() - vmin.y()) / cell);
+        int iz = (int) std::floor((p.z() - vmin.z()) / cell);
+        Float best_d = std::numeric_limits<Float>::infinity();
+        uint32_t best_i = 0;
+        bool found = false;
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz) {
+                    auto it = buckets.find(std::make_tuple(ix+dx, iy+dy, iz+dz));
+                    if (it == buckets.end())
+                        continue;
+                    for (uint32_t j : it->second) {
+                        Float d = (V.col(j) - p).squaredNorm();
+                        if (d < best_d) {
+                            best_d = d;
+                            best_i = j;
+                            found = true;
+                        }
+                    }
+                }
+        if (!found) {
+            for (uint32_t j = 0; j < (uint32_t) V.cols(); ++j) {
+                Float d = (V.col(j) - p).squaredNorm();
+                if (d < best_d) {
+                    best_d = d;
+                    best_i = j;
+                }
+            }
+        }
+        return best_i;
+    };
+
+    uint32_t applied = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#')
+            continue;
+        for (char &c : line)
+            if (c == ',')
+                c = ' ';
+        std::istringstream iss(line);
+        Float px, py, pz, qx, qy, qz, w;
+        if (!(iss >> px >> py >> pz >> qx >> qy >> qz >> w))
+            continue;
+        if (w <= 0)
+            continue;
+        Vector3f p(px, py, pz);
+        Vector3f q(qx, qy, qz);
+        uint32_t v = nearest(p);
+        Vector3f n = N.col(v);
+        q -= n * n.dot(q);
+        Float qn = q.norm();
+        if (qn < RCPOVERFLOW)
+            continue;
+        q /= qn;
+        CQ.col(v) = q;
+        CQw[v] = std::min((Float) 1.0, std::max(CQw[v], w));
+        ++applied;
+    }
+    mRes.propagateConstraints(rosy, posy);
+    cout << "Applied orientation constraints from " << path
+         << " (" << applied << " samples mapped to vertices)." << endl;
+}
+
+static void apply_position_constraints_csv(MultiResolutionHierarchy &mRes,
+                                           const std::string &path,
+                                           int rosy, int posy) {
+    /* Edge-brush: same CSV as CQ, also writes CO/COw. Does not clearConstraints
+       so TokenRig orientation samples survive. */
+    if (path.empty())
+        return;
+    std::ifstream in(path);
+    if (!in)
+        throw std::runtime_error("Failed to open position constraints: " + path);
+
+    const MatrixXf &V = mRes.V();
+    const MatrixXf &N = mRes.N();
+    MatrixXf &CQ = mRes.CQ();
+    VectorXf &CQw = mRes.CQw();
+    MatrixXf &CO = mRes.CO();
+    VectorXf &COw = mRes.COw();
+
+    Vector3f vmin = V.rowwise().minCoeff();
+    Vector3f vmax = V.rowwise().maxCoeff();
+    Float extent = (vmax - vmin).norm();
+    Float cell = std::max(extent / 64.0f, (Float) 1e-4);
+    std::map<std::tuple<int,int,int>, std::vector<uint32_t>> buckets;
+    for (uint32_t i = 0; i < (uint32_t) V.cols(); ++i) {
+        Vector3f p = V.col(i);
+        int ix = (int) std::floor((p.x() - vmin.x()) / cell);
+        int iy = (int) std::floor((p.y() - vmin.y()) / cell);
+        int iz = (int) std::floor((p.z() - vmin.z()) / cell);
+        buckets[std::make_tuple(ix, iy, iz)].push_back(i);
+    }
+
+    auto nearest = [&](const Vector3f &p) -> uint32_t {
+        int ix = (int) std::floor((p.x() - vmin.x()) / cell);
+        int iy = (int) std::floor((p.y() - vmin.y()) / cell);
+        int iz = (int) std::floor((p.z() - vmin.z()) / cell);
+        Float best_d = std::numeric_limits<Float>::infinity();
+        uint32_t best_i = 0;
+        bool found = false;
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz) {
+                    auto it = buckets.find(std::make_tuple(ix+dx, iy+dy, iz+dz));
+                    if (it == buckets.end())
+                        continue;
+                    for (uint32_t j : it->second) {
+                        Float d = (V.col(j) - p).squaredNorm();
+                        if (d < best_d) {
+                            best_d = d;
+                            best_i = j;
+                            found = true;
+                        }
+                    }
+                }
+        if (!found) {
+            for (uint32_t j = 0; j < (uint32_t) V.cols(); ++j) {
+                Float d = (V.col(j) - p).squaredNorm();
+                if (d < best_d) {
+                    best_d = d;
+                    best_i = j;
+                }
+            }
+        }
+        return best_i;
+    };
+
+    uint32_t applied = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#')
+            continue;
+        for (char &c : line)
+            if (c == ',')
+                c = ' ';
+        std::istringstream iss(line);
+        Float px, py, pz, qx, qy, qz, w;
+        if (!(iss >> px >> py >> pz >> qx >> qy >> qz >> w))
+            continue;
+        if (w <= 0)
+            continue;
+        Vector3f p(px, py, pz);
+        Vector3f q(qx, qy, qz);
+        uint32_t v = nearest(p);
+        Vector3f n = N.col(v);
+        q -= n * n.dot(q);
+        Float qn = q.norm();
+        if (qn < RCPOVERFLOW)
+            continue;
+        q /= qn;
+        CQ.col(v) = q;
+        CQw[v] = std::min((Float) 1.0, std::max(CQw[v], w));
+        CO.col(v) = p;
+        COw[v] = std::min((Float) 1.0, std::max(COw[v], w));
+        ++applied;
+    }
+    mRes.propagateConstraints(rosy, posy);
+    cout << "Applied position (edge-brush) constraints from " << path
+         << " (" << applied << " samples mapped to vertices)." << endl;
+}
+
+static void write_orientation_field_csv(const std::string &path,
+                                        const MultiResolutionHierarchy &mRes,
+                                        const std::map<uint32_t, uint32_t> &sing,
+                                        int rosy) {
+    std::ofstream out(path);
+    if (!out)
+        throw std::runtime_error("Failed to open orientation field export: " + path);
+    const MatrixXf &V = mRes.V();
+    const MatrixXf &N = mRes.N();
+    const MatrixXf &Q = mRes.Q();
+    out << "# instant_meshes_fork_orientation_field\n";
+    out << "# rosy=" << rosy << "\n";
+    out << "# vertex_count=" << V.cols() << "\n";
+    out << "# singularity_count=" << sing.size() << "\n";
+    out << "# columns: i,vx,vy,vz,nx,ny,nz,qx,qy,qz,is_singularity\n";
+    for (uint32_t i = 0; i < (uint32_t) V.cols(); ++i) {
+        Vector3f v = V.col(i);
+        Vector3f n = N.col(i);
+        Vector3f q = Q.col(i);
+        int is_sing = sing.count(i) ? 1 : 0;
+        out << i << ','
+            << v.x() << ',' << v.y() << ',' << v.z() << ','
+            << n.x() << ',' << n.y() << ',' << n.z() << ','
+            << q.x() << ',' << q.y() << ',' << q.z() << ','
+            << is_sing << '\n';
+    }
+    cout << "Wrote orientation field CSV (" << V.cols() << " verts, "
+         << sing.size() << " singularities): " << path << endl;
+}
 
 void batch_process(const std::string &input, const std::string &output,
                    int rosy, int posy, Float scale, int face_count,
                    int vertex_count, Float creaseAngle, bool extrinsic,
                    bool align_to_boundaries, int smooth_iter, int knn_points,
-                   bool pure_quad, bool deterministic) {
+                   bool pure_quad, bool deterministic,
+                   const std::string &field_export, bool field_only,
+                   const std::string &flowline_export, Float flowline_density,
+                   const std::string &orientation_constraints,
+                   const std::string &position_constraints) {
     cout << endl;
     cout << "Running in batch mode:" << endl;
     cout << "   Input file             = " << input << endl;
-    cout << "   Output file            = " << output << endl;
+    cout << "   Output file            = " << (output.empty() ? "(none)" : output) << endl;
+    cout << "   Field export CSV       = " << (field_export.empty() ? "(none)" : field_export) << endl;
+    cout << "   Flowline export OBJ    = " << (flowline_export.empty() ? "(none)" : flowline_export) << endl;
+    cout << "   Flowline density scale = " << flowline_density << endl;
+    cout << "   Orientation CQ CSV     = " << (orientation_constraints.empty() ? "(none)" : orientation_constraints) << endl;
+    cout << "   Position CO CSV        = " << (position_constraints.empty() ? "(none)" : position_constraints) << endl;
+    cout << "   Field-only (no extrude)= " << (field_only ? "yes" : "no") << endl;
     cout << "   Rotation symmetry type = " << rosy << endl;
     cout << "   Position symmetry type = " << (posy==3?6:posy) << endl;
     cout << "   Crease angle threshold = ";
@@ -70,12 +310,20 @@ void batch_process(const std::string &input, const std::string &output,
     }
 
     if (scale < 0 && vertex_count < 0 && face_count < 0) {
-        cout << "No target vertex count/face count/scale argument provided. "
-                "Setting to the default of 1/16 * input vertex count." << endl;
-        vertex_count = V.cols() / 16;
+        if (field_only) {
+            /* Keep input average edge length so field preview does not mega-subdivide
+               (old face_count=input faces → tiny scale → millions of verts). */
+            scale = stats.mAverageEdgeLength;
+            cout << "Field-only: defaulting scale to average input edge length "
+                 << scale << endl;
+        } else {
+            cout << "No target vertex count/face count/scale argument provided. "
+                    "Setting to the default of 1/16 * input vertex count." << endl;
+            vertex_count = V.cols() / 16;
+        }
     }
 
-    if (scale > 0) {
+    if (scale > 0 && face_count < 0 && vertex_count < 0) {
         Float face_area = posy == 4 ? (scale*scale) : (std::sqrt(3.f)/4.f*scale*scale);
         face_count = stats.mSurfaceArea / face_area;
         vertex_count = posy == 4 ? face_count : (face_count / 2);
@@ -97,10 +345,15 @@ void batch_process(const std::string &input, const std::string &output,
     MultiResolutionHierarchy mRes;
 
     if (!pointcloud) {
-        /* Subdivide the mesh if necessary */
+        /* Subdivide the mesh if necessary — skip for field-only previews to avoid
+           exploding Trellis characters to millions of verts. */
         VectorXu V2E, E2E;
         VectorXb boundary, nonManifold;
-        if (stats.mMaximumEdgeLength*2 > scale || stats.mMaximumEdgeLength > stats.mAverageEdgeLength * 2) {
+        bool need_subdiv =
+            !field_only &&
+            (stats.mMaximumEdgeLength*2 > scale ||
+             stats.mMaximumEdgeLength > stats.mAverageEdgeLength * 2);
+        if (need_subdiv) {
             cout << "Input mesh is too coarse for the desired output edge length "
                     "(max input mesh edge length=" << stats.mMaximumEdgeLength
                  << "), subdividing .." << endl;
@@ -157,9 +410,23 @@ void batch_process(const std::string &input, const std::string &output,
         mRes.propagateConstraints(rosy, posy);
     }
 
+    if (!orientation_constraints.empty()) {
+        if (align_to_boundaries)
+            cout << "Note: orientation-constraints CSV applied after boundary constraints." << endl;
+        apply_orientation_constraints_csv(mRes, orientation_constraints, rosy, posy);
+    }
+
+    if (!position_constraints.empty()) {
+        if (orientation_constraints.empty() && !align_to_boundaries)
+            mRes.clearConstraints();
+        else if (align_to_boundaries && orientation_constraints.empty())
+            cout << "Note: position-constraints CSV applied after boundary constraints." << endl;
+        apply_position_constraints_csv(mRes, position_constraints, rosy, posy);
+    }
+
     if (bvh) {
         bvh->setData(&mRes.F(), &mRes.V(), &mRes.N());
-    } else if (smooth_iter > 0) {
+    } else if (smooth_iter > 0 || !flowline_export.empty()) {
         bvh = new BVH(&mRes.F(), &mRes.V(), &mRes.N(), stats.mAABB);
         bvh->build();
     }
@@ -184,17 +451,34 @@ void batch_process(const std::string &input, const std::string &output,
     cout << "Orientation field has " << sing.size() << " singularities." << endl;
     timer.reset();
 
+    if (!field_export.empty())
+        write_orientation_field_csv(field_export, mRes, sing, rosy);
+
+    if (!flowline_export.empty()) {
+        if (!bvh) {
+            bvh = new BVH(&mRes.F(), &mRes.V(), &mRes.N(), stats.mAABB);
+            bvh->build();
+        }
+        export_orientation_flowlines_obj(mRes, bvh, stats, rosy, flowline_density, flowline_export);
+    }
+
+    if (field_only) {
+        cout << "Field-only mode: skipping position field + mesh extraction." << endl;
+        optimizer.shutdown();
+        if (bvh)
+            delete bvh;
+        return;
+    }
+
+    if (output.empty())
+        throw std::runtime_error("Batch remesh requires -o/--output (or use --field-only)");
+
     cout << "Optimizing position field .. ";
     cout.flush();
     optimizer.optimizePositions(-1);
     optimizer.notify();
     optimizer.wait();
     cout << "done. (took " << timeString(timer.reset()) << ")" << endl;
-    
-    //std::map<uint32_t, Vector2i> pos_sing;
-    //compute_position_singularities(mRes, sing, pos_sing, extrinsic, rosy, posy);
-    //cout << "Position field has " << pos_sing.size() << " singularities." << endl;
-    //timer.reset();
 
     optimizer.shutdown();
 

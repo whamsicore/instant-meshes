@@ -30,6 +30,12 @@ int main(int argc, char **argv) {
     uint32_t knn_points = 10, smooth_iter = 2;
     Float crease_angle = -1, scale = -1;
     std::string batchOutput;
+    std::string fieldExport;
+    std::string flowlineExport;
+    std::string orientationConstraints;
+    std::string positionConstraints;
+    Float flowline_density = 1.0f;
+    bool field_only = false;
     #if defined(__APPLE__)
         bool launched_from_finder = false;
     #endif
@@ -46,6 +52,38 @@ int main(int argc, char **argv) {
                 extrinsic = false;
             } else if (strcmp("--boundaries", argv[i]) == 0 || strcmp("-b", argv[i]) == 0) {
                 align_to_boundaries = true;
+            } else if (strcmp("--field-only", argv[i]) == 0) {
+                field_only = true;
+            } else if (strcmp("--export-field", argv[i]) == 0) {
+                if (++i >= argc) {
+                    cerr << "Missing --export-field path!" << endl;
+                    return -1;
+                }
+                fieldExport = argv[i];
+            } else if (strcmp("--export-flowlines", argv[i]) == 0) {
+                if (++i >= argc) {
+                    cerr << "Missing --export-flowlines path!" << endl;
+                    return -1;
+                }
+                flowlineExport = argv[i];
+            } else if (strcmp("--flowline-density", argv[i]) == 0) {
+                if (++i >= argc) {
+                    cerr << "Missing --flowline-density value!" << endl;
+                    return -1;
+                }
+                flowline_density = str_to_float(argv[i]);
+            } else if (strcmp("--orientation-constraints", argv[i]) == 0) {
+                if (++i >= argc) {
+                    cerr << "Missing --orientation-constraints path!" << endl;
+                    return -1;
+                }
+                orientationConstraints = argv[i];
+            } else if (strcmp("--position-constraints", argv[i]) == 0) {
+                if (++i >= argc) {
+                    cerr << "Missing --position-constraints path!" << endl;
+                    return -1;
+                }
+                positionConstraints = argv[i];
             } else if (strcmp("--threads", argv[i]) == 0 || strcmp("-t", argv[i]) == 0) {
                 if (++i >= argc) {
                     cerr << "Missing thread count!" << endl;
@@ -144,10 +182,16 @@ int main(int argc, char **argv) {
         help = true;
     }
 
-    if (args.size() > 1 || help || (!batchOutput.empty() && args.size() == 0)) {
+    if (args.size() > 1 || help || ((!batchOutput.empty() || !fieldExport.empty() || !flowlineExport.empty() || field_only) && args.size() == 0)) {
         cout << "Syntax: " << argv[0] << " [options] <input mesh / point cloud / application state snapshot>" << endl;
         cout << "Options:" << endl;
         cout << "   -o, --output <output>     Writes to the specified PLY/OBJ output file in batch mode" << endl;
+        cout << "   --export-field <csv>      After orientation solve, write Q/N/V field CSV" << endl;
+        cout << "   --export-flowlines <obj>  Trace Instant Meshes orientation flow lines to OBJ" << endl;
+        cout << "   --flowline-density <f>    Flow line density scale (default 1.0)" << endl;
+        cout << "   --orientation-constraints <csv>  Bone/stroke CQ samples: px,py,pz,qx,qy,qz,weight" << endl;
+        cout << "   --position-constraints <csv>     Edge-brush CO+CQ samples: px,py,pz,qx,qy,qz,weight" << endl;
+        cout << "   --field-only              Solve orientation only (skip position + extract)" << endl;
         cout << "   -t, --threads <count>     Number of threads used for parallel computations" << endl;
         cout << "   -d, --deterministic       Prefer (slower) deterministic algorithms" << endl;
         cout << "   -c, --crease <degrees>    Dihedral angle threshold for creases" << endl;
@@ -172,12 +216,18 @@ int main(int argc, char **argv) {
 
     tbb::task_scheduler_init init(nprocs == -1 ? tbb::task_scheduler_init::automatic : nprocs);
 
-    if (!batchOutput.empty() && args.size() == 1) {
+    if ((!batchOutput.empty() || !fieldExport.empty() || !flowlineExport.empty() || field_only) && args.size() == 1) {
         try {
+            if (field_only && fieldExport.empty() && flowlineExport.empty()) {
+                cerr << "Error: --field-only requires --export-field and/or --export-flowlines" << endl;
+                return -1;
+            }
             batch_process(args[0], batchOutput, rosy, posy, scale, face_count,
                           vertex_count, crease_angle, extrinsic,
                           align_to_boundaries, smooth_iter, knn_points,
-                          !dominant, deterministic);
+                          !dominant, deterministic, fieldExport, field_only,
+                          flowlineExport, flowline_density, orientationConstraints,
+                          positionConstraints);
             return 0;
         } catch (const std::exception &e) {
             cerr << "Caught runtime error : " << e.what() << endl;
